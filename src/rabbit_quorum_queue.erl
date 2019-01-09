@@ -97,7 +97,7 @@ init_state({Name, _}, QName = #resource{}) ->
                             fun() -> credit_flow:block(Name), ok end,
                             fun() -> credit_flow:unblock(Name), ok end).
 
-handle_event({ra_event, From, Evt}, QState) ->
+handle_event({From, Evt}, QState) ->
     rabbit_fifo_client:handle_ra_event(From, Evt, QState).
 
 -spec declare(rabbit_types:amqqueue()) ->
@@ -152,7 +152,7 @@ ra_machine_config(Q = #amqqueue{name = QName,
       dead_letter_handler => dlx_mfa(Q),
       become_leader_handler => {?MODULE, become_leader, [QName]}}.
 
-cancel_consumer_handler(QName, {ConsumerTag, ChPid}) ->
+cancel_consumer_handler(QName, {ConsumerTag, {_, ChPid}}) ->
     Node = node(ChPid),
     case Node == node() of
         true -> cancel_consumer(QName, ChPid, ConsumerTag);

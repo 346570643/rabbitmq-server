@@ -58,6 +58,7 @@
                    delivery_count = 0 :: non_neg_integer()}).
 
 -record(state, {cluster_name :: cluster_name(),
+                locator :: {reference(), pid()},
                 servers = [] :: [ra_server_id()],
                 leader :: maybe(ra_server_id()),
                 next_seq = 0 :: seq(),
@@ -104,6 +105,7 @@ init(ClusterName, Servers) ->
 init(ClusterName = #resource{}, Servers, SoftLimit) ->
     Timeout = application:get_env(kernel, net_ticktime, 60000) + 5000,
     #state{cluster_name = ClusterName,
+           locator = {make_ref(), self()},
            servers = Servers,
            soft_limit = SoftLimit,
            timeout = Timeout}.
@@ -113,6 +115,7 @@ init(ClusterName = #resource{}, Servers, SoftLimit) ->
 init(ClusterName = #resource{}, Servers, SoftLimit, BlockFun, UnblockFun) ->
     Timeout = application:get_env(kernel, net_ticktime, 60000) + 5000,
     #state{cluster_name = ClusterName,
+           locator = {make_ref(), self()},
            servers = Servers,
            block_handler = BlockFun,
            unblock_handler = UnblockFun,
@@ -134,11 +137,12 @@ init(ClusterName = #resource{}, Servers, SoftLimit, BlockFun, UnblockFun) ->
 -spec enqueue(Correlation :: term(), Msg :: term(), State :: state()) ->
     {ok | slow, state()}.
 enqueue(Correlation, Msg, State0 = #state{slow = Slow,
+                                          locator = Loc,
                                           block_handler = BlockFun}) ->
     Node = pick_node(State0),
     {Next, State1} = next_enqueue_seq(State0),
     % by default there is no correlation id
-    Cmd = rabbit_fifo:make_enqueue(self(), Next, Msg),
+    Cmd = rabbit_fifo:make_enqueue(Loc, Next, Msg),
     case send_command(Node, Correlation, Cmd, low, State1) of
         {slow, _} = Ret when not Slow ->
             BlockFun(),
@@ -179,7 +183,7 @@ enqueue(Msg, State) ->
     {ok, rabbit_fifo:delivery_msg() | empty, state()} | {error | timeout, term()}.
 dequeue(ConsumerTag, Settlement, #state{timeout = Timeout} = State0) ->
     Node = pick_node(State0),
-    ConsumerId = consumer_id(ConsumerTag),
+    ConsumerId = consumer_id(ConsumerTag, State0),
     case ra:process_command(Node,
                             rabbit_fifo:make_checkout(ConsumerId,
                                                       {dequeue, Settlement},
@@ -204,7 +208,7 @@ dequeue(ConsumerTag, Settlement, #state{timeout = Timeout} = State0) ->
     {ok, state()}.
 settle(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     Node = pick_node(State0),
-    Cmd = rabbit_fifo:make_settle(consumer_id(ConsumerTag), MsgIds),
+    Cmd = rabbit_fifo:make_settle(consumer_id(ConsumerTag, State0), MsgIds),
     case send_command(Node, undefined, Cmd, normal, State0) of
         {slow, S} ->
             % turn slow into ok for this function
@@ -214,7 +218,7 @@ settle(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     end;
 settle(ConsumerTag, [_|_] = MsgIds,
        #state{unsent_commands = Unsent0} = State0) ->
-    ConsumerId = consumer_id(ConsumerTag),
+    ConsumerId = consumer_id(ConsumerTag, State0),
     %% we've reached the soft limit so will stash the command to be
     %% sent once we have seen enough notifications
     Unsent = maps:update_with(ConsumerId,
@@ -238,7 +242,7 @@ settle(ConsumerTag, [_|_] = MsgIds,
 return(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     Node = pick_node(State0),
     % TODO: make rabbit_fifo return support lists of message ids
-    Cmd = rabbit_fifo:make_return(consumer_id(ConsumerTag), MsgIds),
+    Cmd = rabbit_fifo:make_return(consumer_id(ConsumerTag, State0), MsgIds),
     case send_command(Node, undefined, Cmd, normal, State0) of
         {slow, S} ->
             % turn slow into ok for this function
@@ -248,7 +252,7 @@ return(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     end;
 return(ConsumerTag, [_|_] = MsgIds,
        #state{unsent_commands = Unsent0} = State0) ->
-    ConsumerId = consumer_id(ConsumerTag),
+    ConsumerId = consumer_id(ConsumerTag, State0),
     %% we've reached the soft limit so will stash the command to be
     %% sent once we have seen enough notifications
     Unsent = maps:update_with(ConsumerId,
@@ -271,7 +275,7 @@ return(ConsumerTag, [_|_] = MsgIds,
     {ok | slow, state()}.
 discard(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     Node = pick_node(State0),
-    Cmd = rabbit_fifo:make_discard(consumer_id(ConsumerTag), MsgIds),
+    Cmd = rabbit_fifo:make_discard(consumer_id(ConsumerTag, State0), MsgIds),
     case send_command(Node, undefined, Cmd, normal, State0) of
         {slow, S} ->
             % turn slow into ok for this function
@@ -281,7 +285,7 @@ discard(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     end;
 discard(ConsumerTag, [_|_] = MsgIds,
         #state{unsent_commands = Unsent0} = State0) ->
-    ConsumerId = consumer_id(ConsumerTag),
+    ConsumerId = consumer_id(ConsumerTag, State0),
     %% we've reached the soft limit so will stash the command to be
     %% sent once we have seen enough notifications
     Unsent = maps:update_with(ConsumerId,
@@ -331,9 +335,10 @@ checkout(ConsumerTag, NumUnsettled, ConsumerInfo, State0) ->
                CreditMode :: rabbit_fifo:credit_mode(),
                Meta :: rabbit_fifo:consumer_meta(),
                state()) -> {ok, state()} | {error | timeout, term()}.
-checkout(ConsumerTag, NumUnsettled, CreditMode, Meta, State0) ->
+checkout(ConsumerTag, NumUnsettled, CreditMode, Meta,
+         State0) ->
     Servers = sorted_servers(State0),
-    ConsumerId = {ConsumerTag, self()},
+    ConsumerId = consumer_id(ConsumerTag, State0),
     Cmd = rabbit_fifo:make_checkout(ConsumerId,
                                     {auto, NumUnsettled, CreditMode},
                                     Meta),
@@ -354,7 +359,7 @@ checkout(ConsumerTag, NumUnsettled, CreditMode, Meta, State0) ->
     {ok, state()}.
 credit(ConsumerTag, Credit, Drain,
        #state{consumer_deliveries = CDels} = State0) ->
-    ConsumerId = consumer_id(ConsumerTag),
+    ConsumerId = consumer_id(ConsumerTag, State0),
     %% the last received msgid provides us with the delivery count if we
     %% add one as it is 0 indexed
     C = maps:get(ConsumerTag, CDels, #consumer{last_msg_id = -1}),
@@ -382,7 +387,7 @@ credit(ConsumerTag, Credit, Drain,
     {ok, state()} | {error | timeout, term()}.
 cancel_checkout(ConsumerTag, #state{consumer_deliveries = CDels} = State0) ->
     Servers = sorted_servers(State0),
-    ConsumerId = {ConsumerTag, self()},
+    ConsumerId = consumer_id(ConsumerTag, State0),
     Cmd = rabbit_fifo:make_checkout(ConsumerId, cancel, #{}),
     State = State0#state{consumer_deliveries = maps:remove(ConsumerTag, CDels)},
     try_process_command(Servers, Cmd, State).
@@ -629,7 +634,8 @@ handle_delivery(Leader, {delivery, Tag, [{FstId, _} | _] = IdMsgs} = Del0,
             %% When the node is disconnected the leader will return all checked
             %% out messages to the main queue to ensure they don't get stuck in
             %% case the node never comes back.
-            Missing = get_missing_deliveries(Leader, Prev+1, FstId-1, Tag),
+            Missing = get_missing_deliveries(Leader, Prev+1, FstId-1,
+                                             consumer_id(Tag, State0)),
             Del = {delivery, Tag, Missing ++ IdMsgs},
             {Del, State0#state{consumer_deliveries =
                                update_consumer(Tag, LastId,
@@ -660,8 +666,7 @@ update_consumer(Tag, LastId, DelCntIncr,
              Consumers).
 
 
-get_missing_deliveries(Leader, From, To, ConsumerTag) ->
-    ConsumerId = consumer_id(ConsumerTag),
+get_missing_deliveries(Leader, From, To, ConsumerId) ->
     % ?INFO("get_missing_deliveries for ~w from ~b to ~b",
     %       [ConsumerId, From, To]),
     Query = fun (State) ->
@@ -688,15 +693,16 @@ next_seq(#state{next_seq = Seq} = State) ->
 next_enqueue_seq(#state{next_enqueue_seq = Seq} = State) ->
     {Seq, State#state{next_enqueue_seq = Seq + 1}}.
 
-consumer_id(ConsumerTag) ->
-    {ConsumerTag, self()}.
+consumer_id(ConsumerTag, State) ->
+    {ConsumerTag, State#state.locator}.
 
 send_command(Server, Correlation, Command, Priority,
-             #state{pending = Pending,
+             #state{locator = Locator,
+                    pending = Pending,
                     priority = Priority,
                     soft_limit = SftLmt} = State0) ->
     {Seq, State} = next_seq(State0),
-    ok = ra:pipeline_command(Server, Command, Seq, Priority),
+    ok = ra:pipeline_command(Server, Command, Seq, Priority, Locator),
     Tag = case maps:size(Pending) >= SftLmt of
               true -> slow;
               false -> ok
@@ -718,9 +724,10 @@ send_command(Node, Correlation, Command, low,
                  State#state{priority = low}).
 
 resend_command(Node, Correlation, Command,
-               #state{pending = Pending} = State0) ->
+               #state{locator = Locator,
+                      pending = Pending} = State0) ->
     {Seq, State} = next_seq(State0),
-    ok = ra:pipeline_command(Node, Command, Seq),
+    ok = ra:pipeline_command(Node, Command, Seq, normal, Locator),
     State#state{pending = Pending#{Seq => {Correlation, Command}}}.
 
 add_command(_, _, [], Acc) ->
